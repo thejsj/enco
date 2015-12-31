@@ -15,7 +15,7 @@ import (
 )
 
 type VideoEncodingPayloadJob struct {
-	name string
+	Name string `json:"name"`
 }
 
 func failOnError(err error, msg string) {
@@ -26,20 +26,32 @@ func failOnError(err error, msg string) {
 }
 
 func encodeVideo(videoFilename string, s3bucket *s3.Bucket) {
-	log.Printf("Start Downloading: %s", videoFilename)
-	videoBinary, err := s3bucket.Get(videoFilename)
 
-	if err != nil {
-		log.Fatal("Error getting file (%s). Error: %s", videoFilename, err)
-	}
-	log.Printf("Done downloading (%s). Size: %s", videoFilename, binary.Size(videoBinary))
 	pwd, _ := os.Getwd()
 	filenameForFile := pwd + "/" + videoFilename
-	log.Printf("Wrting file to: %s", filenameForFile)
-	ioerr := ioutil.WriteFile(filenameForFile, videoBinary, 0644)
-	if ioerr != nil {
-		log.Fatal(ioerr)
+
+	// Check if Video is already in HDD
+	if _, err := os.Stat(filenameForFile); os.IsNotExist(err) {
+		log.Printf("File not in memory. Starting Download: %s", filenameForFile)
+		videoBinary, err := s3bucket.Get(videoFilename)
+
+		if err != nil {
+			log.Fatalf("Error getting file (%s). Error: %s", videoFilename, err)
+		}
+		log.Printf("Done downloading (%s). Size: %s", videoFilename, binary.Size(videoBinary))
+		log.Printf("Wrting file to: %s", filenameForFile)
+		// Do we really need to write the file?
+		ioerr := ioutil.WriteFile(filenameForFile, videoBinary, 0644)
+		if ioerr != nil {
+			log.Fatal(ioerr)
+		}
 	}
+
+	res, err := ConvertVideo(filenameForFile)
+	if err != nil {
+		log.Fatalf("Error converting video %v", err)
+	}
+	log.Fatalf("Video converted succesfully: %v", res)
 }
 
 func main() {
@@ -107,15 +119,15 @@ func main() {
 			log.Printf("Received a message: %s", d.Body)
 			d.Ack(false)
 
-			var job []VideoEncodingPayloadJob
-			err := json.Unmarshal(d.Body, &job)
+			var job VideoEncodingPayloadJob
+			err := json.Unmarshal([]byte(d.Body), &job)
 			if err != nil {
-				log.Fatal("Error unmarshalling JSON: %v", d.Body)
+				log.Fatalf("Error unmarshalling JSON: %s (%s)", err, d.Body)
+			} else {
+				log.Printf("Done")
+				log.Printf("Start Encoding Video: %v", job.Name)
+				encodeVideo(job.Name, s3bucket)
 			}
-			log.Printf("%v", job)
-			log.Printf("Start Encoding Video: %s", d.Body)
-			encodeVideo(job["name"].(string), s3bucket)
-			log.Printf("Done")
 		}
 	}()
 
