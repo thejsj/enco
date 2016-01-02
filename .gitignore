@@ -1,2 +1,4 @@
 .env
-
+*.jpg
+*.png
+.DS_Store

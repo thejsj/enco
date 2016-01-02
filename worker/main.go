@@ -1,20 +1,21 @@
 package main
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/mitchellh/goamz/aws"
 	"github.com/mitchellh/goamz/s3"
 	"github.com/streadway/amqp"
+	"github.com/thejsj/veenco/worker/image-converter"
 )
 
-type VideoEncodingPayloadJob struct {
+type ImageConverationPayloadJob struct {
 	Name string `json:"name"`
 }
 
@@ -25,33 +26,35 @@ func failOnError(err error, msg string) {
 	}
 }
 
-func encodeVideo(videoFilename string, s3bucket *s3.Bucket) {
+func convertImage(imageFilename string, s3bucket *s3.Bucket) (err error) {
 
 	pwd, _ := os.Getwd()
-	filenameForFile := pwd + "/" + videoFilename
+	filenameForFile := pwd + "/" + imageFilename
 
 	// Check if Video is already in HDD
 	if _, err := os.Stat(filenameForFile); os.IsNotExist(err) {
 		log.Printf("File not in memory. Starting Download: %s", filenameForFile)
-		videoBinary, err := s3bucket.Get(videoFilename)
+		binary, err := s3bucket.Get(imageFilename)
 
 		if err != nil {
-			log.Fatalf("Error getting file (%s). Error: %s", videoFilename, err)
+			log.Fatalf("Error getting file (%s). Error: %s", imageFilename, err)
 		}
-		log.Printf("Done downloading (%s). Size: %s", videoFilename, binary.Size(videoBinary))
+		log.Printf("Done downloading (%s). Size: %s", imageFilename)
 		log.Printf("Wrting file to: %s", filenameForFile)
 		// Do we really need to write the file?
-		ioerr := ioutil.WriteFile(filenameForFile, videoBinary, 0644)
+		ioerr := ioutil.WriteFile(filenameForFile, binary, 0644)
 		if ioerr != nil {
 			log.Fatal(ioerr)
 		}
 	}
 
-	res, err := ConvertVideo(filenameForFile)
+	err = imageConverter.Resize(filenameForFile)
 	if err != nil {
-		log.Fatalf("Error converting video %v", err)
+		log.Printf("Error converting video %v", err)
+		return err
 	}
-	log.Fatalf("Video converted succesfully: %v", res)
+	log.Printf("Image converted succesfully: %v")
+	return nil
 }
 
 func main() {
@@ -116,17 +119,24 @@ func main() {
 
 	go func() {
 		for d := range msgs {
+			time.Sleep(time.Duration(2) * time.Second)
 			log.Printf("Received a message: %s", d.Body)
-			d.Ack(false)
 
-			var job VideoEncodingPayloadJob
+			var job ImageConverationPayloadJob
 			err := json.Unmarshal([]byte(d.Body), &job)
 			if err != nil {
-				log.Fatalf("Error unmarshalling JSON: %s (%s)", err, d.Body)
+				d.Nack(false, false)
+				log.Printf("Error unmarshalling JSON: %s (%s)", err, d.Body)
 			} else {
 				log.Printf("Done")
-				log.Printf("Start Encoding Video: %v", job.Name)
-				encodeVideo(job.Name, s3bucket)
+				log.Printf("Start Converting Image: %v", job.Name)
+				err := convertImage(job.Name, s3bucket)
+				if err != nil {
+					d.Nack(false, true)
+					log.Printf("Error Converting Image: %v", job.Name)
+				}
+				d.Ack(false)
+				log.Printf("Done Converting Image: %v", job.Name)
 			}
 		}
 	}()
