@@ -52,7 +52,7 @@ func Resize(fileName string) (resizeError error) {
 	converteImageFileName := name + "-" + string(time.Now().Format(time.RFC850)) + fileExtension
 
 	log.Printf("Starting to convert image: %v", converteImageFileName)
-	mw.WriteImage(converteImageFileName)
+	mw.WriteImage("images/" + converteImageFileName)
 	log.Printf("Finished converting image: %v", converteImageFileName)
 	return nil
 }
