@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"time"
 	"unicode/utf8"
 
 	"code.google.com/p/go-uuid/uuid"
@@ -23,11 +24,42 @@ import (
 var session *r.Session
 
 type ImageEntry struct {
-	Id               string `gorethink:"id"`
-	S3Filename       string `gorethink:"S3Filename"`
-	OriginalFileName string `gorethink:"originalFileName"`
-	ContentType      string `gorethink:"contentType"`
-	CreatedAt        r.Term `gorethinkdb:"createdAt,omitempty"`
+	Id               string    `gorethink:"id,omitempty"`
+	S3Filename       string    `gorethink:"s3Filename,omitempty"`
+	OriginalFileName string    `gorethink:"originalFileName,omitempty"`
+	ContentType      string    `gorethink:"contentType,omitempty"`
+	CreatedAt        time.Time `gorethink:"createAt,omitempty"`
+}
+
+// Transformation
+type TransformationJob struct {
+	JobType string      `json:"jobType"`
+	Data    interface{} `json:"data"`
+}
+
+type TransformationJobCollection struct {
+	Transformations []TransformationJob `json:"transformations"`
+}
+
+// Jobs
+
+type ImageResizeToWidthPxJob struct {
+	Width int `json:"width"`
+}
+
+type ImageResizeToHeightPxJob struct {
+	Height int
+}
+
+type ImageResizeByPercentageJob struct {
+	Percentage float64
+}
+
+type ImageCropByPercentageJob struct {
+	Top    int
+	Right  int
+	Bottom int
+	Left   int
 }
 
 func IndexHandler(session *r.Session) func(writer http.ResponseWriter, req *http.Request, _ httprouter.Params) {
@@ -102,7 +134,7 @@ func ImagePostHandler(session *r.Session, s3bucket *s3.Bucket) func(writer http.
 			S3Filename:       s3UploadFilename,
 			OriginalFileName: fileHeader.Filename,
 			ContentType:      contentType,
-			CreatedAt:        r.Now(),
+			CreatedAt:        time.Now(),
 		}
 		reqlErr := r.Table("images").Insert(newImage).Exec(session)
 		handleError(writer, reqlErr, "Error inserting image entry into database")
@@ -124,6 +156,18 @@ func ImagePostHandler(session *r.Session, s3bucket *s3.Bucket) func(writer http.
 	}
 }
 
+func ConvertToStruct(obj interface{}, target interface{}) (err error) {
+	jsonObj, jsonMarshalErr := json.Marshal(obj)
+	if jsonMarshalErr != nil {
+		return jsonMarshalErr
+	}
+	jsonUnmarshalErr := json.Unmarshal(jsonObj, &target)
+	if jsonUnmarshalErr != nil {
+		return jsonUnmarshalErr
+	}
+	return nil
+}
+
 func TransformationPostHandler(session *r.Session, s3bucket *s3.Bucket) func(writer http.ResponseWriter, req *http.Request, _ httprouter.Params) {
 	return func(writer http.ResponseWriter, req *http.Request, params httprouter.Params) {
 
@@ -134,7 +178,7 @@ func TransformationPostHandler(session *r.Session, s3bucket *s3.Bucket) func(wri
 			return
 		}
 		log.Printf("Querying for document: %s", imageUuid)
-		cursor, cursorErr := r.Table("images").Get(imageUuid).Run(session)
+		cursor, cursorErr := r.Table("images").Get(imageUuid.String()).Run(session)
 		if cursorErr == r.ErrEmptyResult {
 			errMessage := fmt.Sprintf("No document with uuid `%s` could be found", imageUuid)
 			http.Error(writer, errMessage, http.StatusInternalServerError)
@@ -143,12 +187,32 @@ func TransformationPostHandler(session *r.Session, s3bucket *s3.Bucket) func(wri
 		handleError(writer, cursorErr, "Error reading file")
 
 		var imageEntry ImageEntry
-		log.Printf("Getting document from cursor")
 		cursor.One(&imageEntry)
 		defer cursor.Close()
 
+		// Parse jobs in body
+		body, ioErr := ioutil.ReadAll(req.Body)
+		handleError(writer, ioErr, "Error reading body of request")
+		var jobCollection TransformationJobCollection
+		jsonUnmarshalErr := json.Unmarshal(body, &jobCollection)
+		handleError(writer, jsonUnmarshalErr, "Error unmarshalling body into job collection")
+
+		// Parse all jobs in job collection
+		for _, job := range jobCollection.Transformations {
+			if job.JobType == "resizeToWidthPx" {
+				var validJob ImageResizeToWidthPxJob
+				conversionError := ConvertToStruct(job.Data, &validJob)
+				if conversionError != nil {
+					log.Printf("Conversion NOT succseful: ", validJob, conversionError, job.Data)
+				}
+				log.Printf("Conversion succseful: ", validJob)
+			} else {
+				log.Printf("Type not found: %v", job.JobType)
+			}
+		}
+
 		log.Printf("Parsing document into JSON response")
-		jsonResponse, jsonMarshalErr := json.Marshal(imageEntry)
+		jsonResponse, jsonMarshalErr := json.Marshal(jobCollection)
 		handleError(writer, jsonMarshalErr, "Error Marshalling JSON")
 		writer.Header().Set("Content-Type", "application/json")
 		writer.Write([]byte(jsonResponse))
