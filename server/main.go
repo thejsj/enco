@@ -11,6 +11,8 @@ import (
 	"path"
 	"unicode/utf8"
 
+	"code.google.com/p/go-uuid/uuid"
+
 	r "github.com/dancannon/gorethink"
 	"github.com/joho/godotenv"
 	"github.com/julienschmidt/httprouter"
@@ -21,10 +23,11 @@ import (
 var session *r.Session
 
 type ImageEntry struct {
-	Id               string `gorethink:"id,omitempty"`
+	Id               string `gorethink:"id"`
+	S3Filename       string `gorethink:"S3Filename"`
 	OriginalFileName string `gorethink:"originalFileName"`
 	ContentType      string `gorethink:"contentType"`
-	CreatedAt        r.Term `gorethinkdb:"createdAt"`
+	CreatedAt        r.Term `gorethinkdb:"createdAt,omitempty"`
 }
 
 func IndexHandler(session *r.Session) func(writer http.ResponseWriter, req *http.Request, _ httprouter.Params) {
@@ -73,15 +76,17 @@ func ImagePostHandler(session *r.Session, s3bucket *s3.Bucket) func(writer http.
 		log.Printf("Content type", req.Header.Get("Content-Type"))
 
 		req.ParseMultipartForm(32 << 20)
-		file, fileHeader, formFileError := req.FormFile("imageUpload")
-		handleError(writer, formFileError, "Error getting imageUpload")
+		fieldName := "fileUpload"
+		file, fileHeader, formFileError := req.FormFile(fieldName)
+		handleError(writer, formFileError, fmt.Sprintf("Error getting %s", fieldName))
+		if file == nil {
+			errMessage := fmt.Sprintf("`%s` field is required, but is currently empty", fieldName)
+			http.Error(writer, errMessage, http.StatusInternalServerError)
+			return
+		}
 		defer file.Close()
 
-		cursor, cursorErr := r.UUID().CoerceTo("STRING").Run(session)
-		handleError(writer, cursorErr, "Error reading file")
-
-		var uuid string
-		cursor.One(&uuid)
+		uuid := uuid.New()
 		extension := path.Ext(fileHeader.Filename)
 		s3UploadFilename := uuid + extension
 		buffer, err := ioutil.ReadAll(file)
@@ -93,7 +98,8 @@ func ImagePostHandler(session *r.Session, s3bucket *s3.Bucket) func(writer http.
 		handleError(writer, s3PutErr, "Error uploading object to S3 bucket")
 
 		newImage := ImageEntry{
-			Id:               s3UploadFilename,
+			Id:               uuid,
+			S3Filename:       s3UploadFilename,
 			OriginalFileName: fileHeader.Filename,
 			ContentType:      contentType,
 			CreatedAt:        r.Now(),
@@ -104,7 +110,8 @@ func ImagePostHandler(session *r.Session, s3bucket *s3.Bucket) func(writer http.
 		log.Printf("Getting URL for object...")
 		url := s3bucket.URL(s3UploadFilename)
 		var responseMap = map[string]string{
-			"filename":          s3UploadFilename,
+			"id":                uuid,
+			"s3-filename":       s3UploadFilename,
 			"original-filename": fileHeader.Filename,
 			"url":               url,
 			"content-type":      contentType,
@@ -119,10 +126,29 @@ func ImagePostHandler(session *r.Session, s3bucket *s3.Bucket) func(writer http.
 
 func TransformationPostHandler(session *r.Session, s3bucket *s3.Bucket) func(writer http.ResponseWriter, req *http.Request, _ httprouter.Params) {
 	return func(writer http.ResponseWriter, req *http.Request, params httprouter.Params) {
-		responseMap := map[string]string{
-			"id": params.ByName("id"),
+
+		imageUuid := uuid.Parse(params.ByName("id"))
+		if imageUuid == nil {
+			errMessage := fmt.Sprintf("`%s` field is not a valid UUID", params.ByName("id"))
+			http.Error(writer, errMessage, http.StatusInternalServerError)
+			return
 		}
-		jsonResponse, jsonMarshalErr := json.Marshal(responseMap)
+		log.Printf("Querying for document: %s", imageUuid)
+		cursor, cursorErr := r.Table("images").Get(imageUuid).Run(session)
+		if cursorErr == r.ErrEmptyResult {
+			errMessage := fmt.Sprintf("No document with uuid `%s` could be found", imageUuid)
+			http.Error(writer, errMessage, http.StatusInternalServerError)
+			return
+		}
+		handleError(writer, cursorErr, "Error reading file")
+
+		var imageEntry ImageEntry
+		log.Printf("Getting document from cursor")
+		cursor.One(&imageEntry)
+		defer cursor.Close()
+
+		log.Printf("Parsing document into JSON response")
+		jsonResponse, jsonMarshalErr := json.Marshal(imageEntry)
 		handleError(writer, jsonMarshalErr, "Error Marshalling JSON")
 		writer.Header().Set("Content-Type", "application/json")
 		writer.Write([]byte(jsonResponse))
@@ -163,7 +189,9 @@ func main() {
 	router := httprouter.New()
 	router.GET("/", IndexHandler(session))
 	router.POST("/image", ImagePostHandler(session, s3bucket))
+	router.POST("/image/", ImagePostHandler(session, s3bucket))
 	router.POST("/image/:id/transformation", TransformationPostHandler(session, s3bucket))
+	router.POST("/image/:id/transformation/", TransformationPostHandler(session, s3bucket))
 
 	log.Printf("HTTP Server listening on port: %s", os.Getenv("HTTP_PORT"))
 	log.Fatal(http.ListenAndServe(":"+os.Getenv("HTTP_PORT"), router))
