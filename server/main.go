@@ -3,12 +3,15 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"path"
+	"reflect"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -33,8 +36,8 @@ type ImageEntry struct {
 
 // Transformation
 type TransformationJob struct {
-	JobType string      `json:"jobType"`
-	Data    interface{} `json:"data"`
+	JobType string                 `json:"jobType"`
+	Data    map[string]interface{} `json:"data"`
 }
 
 type TransformationJobCollection struct {
@@ -44,11 +47,11 @@ type TransformationJobCollection struct {
 // Jobs
 
 type ImageResizeToWidthPxJob struct {
-	Width int `json:"width"`
+	Width float64 `json:"width,omitempty"`
 }
 
 type ImageResizeToHeightPxJob struct {
-	Height int
+	Height float64
 }
 
 type ImageResizeByPercentageJob struct {
@@ -65,7 +68,7 @@ type ImageCropByPercentageJob struct {
 func IndexHandler(session *r.Session) func(writer http.ResponseWriter, req *http.Request, _ httprouter.Params) {
 	return func(writer http.ResponseWriter, req *http.Request, _ httprouter.Params) {
 		log.Printf("Get IndexHandler")
-		res, err := r.Expr([]interface{}{1, 2, 3, 4, 5}).Run(session)
+		res, err := r.Table("images").Run(session)
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusInternalServerError)
 			return
@@ -156,7 +159,7 @@ func ImagePostHandler(session *r.Session, s3bucket *s3.Bucket) func(writer http.
 	}
 }
 
-func ConvertToStruct(obj interface{}, target interface{}) (err error) {
+func ConvertToStruct(obj map[string]interface{}, target interface{}) (err error) {
 	jsonObj, jsonMarshalErr := json.Marshal(obj)
 	if jsonMarshalErr != nil {
 		return jsonMarshalErr
@@ -164,6 +167,40 @@ func ConvertToStruct(obj interface{}, target interface{}) (err error) {
 	jsonUnmarshalErr := json.Unmarshal(jsonObj, &target)
 	if jsonUnmarshalErr != nil {
 		return jsonUnmarshalErr
+	}
+	return nil
+}
+
+func SetField(obj interface{}, name string, value interface{}) error {
+	// Convert to Capitalized
+	name = strings.Title(name)
+	structValue := reflect.ValueOf(obj).Elem()
+	structFieldValue := structValue.FieldByName(name)
+
+	if !structFieldValue.IsValid() {
+		return fmt.Errorf("No such field: %s in obj", name)
+	}
+
+	if !structFieldValue.CanSet() {
+		return fmt.Errorf("Cannot set %s field value", name)
+	}
+
+	structFieldType := structFieldValue.Type()
+	val := reflect.ValueOf(value)
+	if structFieldType != val.Type() {
+		return errors.New("Provided value type didn't match obj field type")
+	}
+
+	structFieldValue.Set(val)
+	return nil
+}
+
+func FillStruct(data map[string]interface{}, result interface{}) error {
+	for key, value := range data {
+		err := SetField(result, key, value)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -198,21 +235,37 @@ func TransformationPostHandler(session *r.Session, s3bucket *s3.Bucket) func(wri
 		handleError(writer, jsonUnmarshalErr, "Error unmarshalling body into job collection")
 
 		// Parse all jobs in job collection
+		var validJobs []interface{}
+		var invalidJobs []interface{}
 		for _, job := range jobCollection.Transformations {
 			if job.JobType == "resizeToWidthPx" {
 				var validJob ImageResizeToWidthPxJob
-				conversionError := ConvertToStruct(job.Data, &validJob)
-				if conversionError != nil {
-					log.Printf("Conversion NOT succseful: ", validJob, conversionError, job.Data)
+				err := FillStruct(job.Data, &validJob)
+				if err != nil {
+					invalidJobs = append(invalidJobs, job.Data)
+				} else {
+					validJobs = append(validJobs, validJob)
 				}
-				log.Printf("Conversion succseful: ", validJob)
 			} else {
-				log.Printf("Type not found: %v", job.JobType)
+				invalidJobs = append(invalidJobs, job.Data)
+			}
+		}
+
+		// Return error if there are any invalid jobs
+		var response map[string][]interface{}
+		if len(invalidJobs) > 0 {
+			response = map[string][]interface{}{
+				"validJobs":   validJobs,
+				"invalidJobs": invalidJobs,
+			}
+		} else {
+			response = map[string][]interface{}{
+				"jobs": validJobs,
 			}
 		}
 
 		log.Printf("Parsing document into JSON response")
-		jsonResponse, jsonMarshalErr := json.Marshal(jobCollection)
+		jsonResponse, jsonMarshalErr := json.Marshal(response)
 		handleError(writer, jsonMarshalErr, "Error Marshalling JSON")
 		writer.Header().Set("Content-Type", "application/json")
 		writer.Write([]byte(jsonResponse))
