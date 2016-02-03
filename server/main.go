@@ -3,32 +3,31 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"path"
-	"reflect"
-	"strings"
 	"time"
 	"unicode/utf8"
 
 	"code.google.com/p/go-uuid/uuid"
 
 	r "github.com/dancannon/gorethink"
+	"github.com/fatih/structs"
 	"github.com/joho/godotenv"
 	"github.com/julienschmidt/httprouter"
 	"github.com/mitchellh/goamz/aws"
 	"github.com/mitchellh/goamz/s3"
+	"github.com/streadway/amqp"
 )
 
 var session *r.Session
 
 type ImageEntry struct {
-	Id               string    `gorethink:"id,omitempty"`
-	S3Filename       string    `gorethink:"s3Filename,omitempty"`
+	Id               string    `gorethink:"id"`
+	S3Filename       string    `gorethink:"s3Filename"`
 	OriginalFileName string    `gorethink:"originalFileName,omitempty"`
 	ContentType      string    `gorethink:"contentType,omitempty"`
 	CreatedAt        time.Time `gorethink:"createAt,omitempty"`
@@ -46,8 +45,15 @@ type TransformationJobCollection struct {
 
 // Jobs
 
+type Job struct {
+	Id      string `gorethink:"id"`
+	ImageId string `gorethink:"imageId"`
+	NextJob string `gorethink:"nextJob,omitempty"`
+}
+
 type ImageResizeToWidthPxJob struct {
-	Width float64 `json:"width,omitempty"`
+	Job
+	Width float64 `gorethink:"width"`
 }
 
 type ImageResizeToHeightPxJob struct {
@@ -63,6 +69,13 @@ type ImageCropByPercentageJob struct {
 	Right  int
 	Bottom int
 	Left   int
+}
+
+func failOnError(err error, msg string) {
+	if err != nil {
+		log.Fatalf("%s: %s", msg, err)
+		panic(fmt.Sprintf("%s: %s", msg, err))
+	}
 }
 
 func IndexHandler(session *r.Session) func(writer http.ResponseWriter, req *http.Request, _ httprouter.Params) {
@@ -159,53 +172,7 @@ func ImagePostHandler(session *r.Session, s3bucket *s3.Bucket) func(writer http.
 	}
 }
 
-func ConvertToStruct(obj map[string]interface{}, target interface{}) (err error) {
-	jsonObj, jsonMarshalErr := json.Marshal(obj)
-	if jsonMarshalErr != nil {
-		return jsonMarshalErr
-	}
-	jsonUnmarshalErr := json.Unmarshal(jsonObj, &target)
-	if jsonUnmarshalErr != nil {
-		return jsonUnmarshalErr
-	}
-	return nil
-}
-
-func SetField(obj interface{}, name string, value interface{}) error {
-	// Convert to Capitalized
-	name = strings.Title(name)
-	structValue := reflect.ValueOf(obj).Elem()
-	structFieldValue := structValue.FieldByName(name)
-
-	if !structFieldValue.IsValid() {
-		return fmt.Errorf("No such field: %s in obj", name)
-	}
-
-	if !structFieldValue.CanSet() {
-		return fmt.Errorf("Cannot set %s field value", name)
-	}
-
-	structFieldType := structFieldValue.Type()
-	val := reflect.ValueOf(value)
-	if structFieldType != val.Type() {
-		return errors.New("Provided value type didn't match obj field type")
-	}
-
-	structFieldValue.Set(val)
-	return nil
-}
-
-func FillStruct(data map[string]interface{}, result interface{}) error {
-	for key, value := range data {
-		err := SetField(result, key, value)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func TransformationPostHandler(session *r.Session, s3bucket *s3.Bucket) func(writer http.ResponseWriter, req *http.Request, _ httprouter.Params) {
+func TransformationPostHandler(session *r.Session, s3bucket *s3.Bucket, rabbitMQChannel *amqp.Channel) func(writer http.ResponseWriter, req *http.Request, _ httprouter.Params) {
 	return func(writer http.ResponseWriter, req *http.Request, params httprouter.Params) {
 
 		imageUuid := uuid.Parse(params.ByName("id"))
@@ -240,11 +207,13 @@ func TransformationPostHandler(session *r.Session, s3bucket *s3.Bucket) func(wri
 		for _, job := range jobCollection.Transformations {
 			if job.JobType == "resizeToWidthPx" {
 				var validJob ImageResizeToWidthPxJob
+				validJob.Job.Id = uuid.New()
+				validJob.Job.ImageId = imageEntry.Id
 				err := FillStruct(job.Data, &validJob)
 				if err != nil {
 					invalidJobs = append(invalidJobs, job.Data)
 				} else {
-					validJobs = append(validJobs, validJob)
+					validJobs = append(validJobs, validJob.Job)
 				}
 			} else {
 				invalidJobs = append(invalidJobs, job.Data)
@@ -255,13 +224,39 @@ func TransformationPostHandler(session *r.Session, s3bucket *s3.Bucket) func(wri
 		var response map[string][]interface{}
 		if len(invalidJobs) > 0 {
 			response = map[string][]interface{}{
-				"validJobs":   validJobs,
 				"invalidJobs": invalidJobs,
+				"validJobs":   validJobs,
 			}
 		} else {
 			response = map[string][]interface{}{
 				"jobs": validJobs,
 			}
+		}
+
+		// Add next jobs to struct
+		for i, job := range validJobs {
+			log.Printf("Valid Job %v %+v", i, job)
+			log.Printf("Len %v", len(validJobs))
+			log.Printf("Res %v", len(validJobs) != (i+1))
+			if len(validJobs) != (i + 1) {
+				nextJob := structs.New(validJobs[i+1])
+				nextJobId := nextJob.Field("Id")
+				nextJobIdValue := nextJobId.Value().(string)
+				log.Printf("NextJobIdValue %v", nextJobIdValue)
+
+				jobStruct := structs.New(job)
+				nextJobField := jobStruct.Field("NextJob")
+				nextJobField.Set(nextJobIdValue)
+				log.Printf("Job %+v", job)
+				log.Printf("Job- %+v", jobStruct)
+				log.Printf(" --- END ---")
+			}
+		}
+
+		// Add jobs to the db
+		for _, job := range validJobs {
+			reqlErr := r.Table("jobs").Insert(job).Exec(session)
+			handleError(writer, reqlErr, "Error inserting image entry into database")
 		}
 
 		log.Printf("Parsing document into JSON response")
@@ -296,19 +291,41 @@ func main() {
 		SecretKey: os.Getenv("AWS_SECRET_KEY"),
 	}
 
+	// Connect to S3
 	connection := s3.New(auth, aws.USWest2)
 	bucketName := os.Getenv("S3_BUCKET_NAME")
 	log.Printf("Accessing Bucket: %s", bucketName)
 	s3bucket := connection.Bucket(bucketName)
 	s3bucket.PutBucket(s3.PublicReadWrite)
 
+	// Connect to RabbitMQ
+	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
+	failOnError(err, "Failed to connect to RabbitMQ")
+	defer conn.Close()
+
+	// Open Channel
+	rabbitMQChannel, err := conn.Channel()
+	failOnError(err, "Failed to open a channel")
+	defer rabbitMQChannel.Close()
+
+	err = rabbitMQChannel.ExchangeDeclare(
+		"images", // name
+		"direct", // type
+		true,     // durable
+		false,    // auto-deleted
+		false,    // internal
+		false,    // no-wait
+		nil,      // arguments
+	)
+	failOnError(err, "Failed to declare an exchange")
+
 	log.Printf("Binding Router...")
 	router := httprouter.New()
 	router.GET("/", IndexHandler(session))
 	router.POST("/image", ImagePostHandler(session, s3bucket))
 	router.POST("/image/", ImagePostHandler(session, s3bucket))
-	router.POST("/image/:id/transformation", TransformationPostHandler(session, s3bucket))
-	router.POST("/image/:id/transformation/", TransformationPostHandler(session, s3bucket))
+	router.POST("/image/:id/transformation", TransformationPostHandler(session, s3bucket, rabbitMQChannel))
+	router.POST("/image/:id/transformation/", TransformationPostHandler(session, s3bucket, rabbitMQChannel))
 
 	log.Printf("HTTP Server listening on port: %s", os.Getenv("HTTP_PORT"))
 	log.Fatal(http.ListenAndServe(":"+os.Getenv("HTTP_PORT"), router))
